@@ -59,7 +59,7 @@ This section details how to host and run the bot yourself.
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/snooker-bot.git
+git clone https://github.com/Viternity/snooker-bot.git
 cd snooker-bot
 ```
 
