@@ -5,6 +5,7 @@ import discord
 from discord.ext import commands
 import sqlite3
 import random
+import asyncio
 from dotenv import load_dotenv
 import os
 from datetime import datetime
@@ -97,6 +98,20 @@ def setup_database():
             FOREIGN KEY(competition_id) REFERENCES competitions(id),
             FOREIGN KEY(winner_id) REFERENCES players(id),
             FOREIGN KEY(loser_id) REFERENCES players(id)
+        )
+    ''')
+
+    # New table to store generated fixtures
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS fixtures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            competition_id INTEGER NOT NULL,
+            week INTEGER, -- For leagues
+            round INTEGER, -- For cups
+            participant1_id INTEGER NOT NULL,
+            participant2_id INTEGER, -- Can be NULL for a bye
+            is_complete BOOLEAN DEFAULT 0,
+            FOREIGN KEY(competition_id) REFERENCES competitions(id) ON DELETE CASCADE
         )
     ''')
     
@@ -384,81 +399,124 @@ async def generate_fixtures(ctx, comp_name: str):
     cursor.execute("SELECT * FROM competitions WHERE name = ?", (comp_name,))
     comp = cursor.fetchone()
     if not comp:
+        conn.close()
         return await ctx.send(f"⚠️ Competition '{comp_name}' not found.")
+
+    # Check for existing fixtures and ask for confirmation to overwrite
+    cursor.execute("SELECT id FROM fixtures WHERE competition_id = ?", (comp['id'],))
+    if cursor.fetchone():
+        await ctx.send("⚠️ Fixtures already exist for this competition. Regenerating will delete them. **Are you sure?** (yes/no)")
+        
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() in ['yes', 'no']
+        
+        try:
+            msg = await bot.wait_for('message', timeout=30.0, check=check)
+            if msg.content.lower() == 'no':
+                await ctx.send("Fixture generation cancelled.")
+                conn.close()
+                return
+        except asyncio.TimeoutError:
+            await ctx.send("No response received. Aborting fixture generation.")
+            conn.close()
+            return
+        
+        # User confirmed, so delete old fixtures
+        cursor.execute("DELETE FROM fixtures WHERE competition_id = ?", (comp['id'],))
+        conn.commit()
+        await ctx.send("Old fixtures cleared. Generating new ones...")
     
     if not comp['fixtures_channel_id']:
+        conn.close()
         return await ctx.send(f"⚠️ Please set a fixtures channel for '{comp_name}' first using `!comp_channel`.")
     
     output_channel = bot.get_channel(comp['fixtures_channel_id'])
     if not output_channel:
+        conn.close()
         return await ctx.send(f"⚠️ Could not find the fixtures channel. Maybe I don't have permission to see it?")
-
-    # Fetch participants for this competition
-    cursor.execute("""
-        SELECT p.name FROM competition_participants cp
-        JOIN teams p ON cp.participant_id = p.id
-        WHERE cp.competition_id = ? AND cp.participant_type = 'team'
-    """, (comp['id'],))
-    teams = [row['name'] for row in cursor.fetchall()]
-
-    cursor.execute("""
-        SELECT p.id, p.name FROM competition_participants cp
-        JOIN players p ON cp.participant_id = p.id
-        WHERE cp.competition_id = ? AND cp.participant_type = 'player'
-    """, (comp['id'],))
-    players = cursor.fetchall()
-    conn.close()
 
     embed = discord.Embed(title=f"🗓️ Fixtures for {comp_name}", color=discord.Color.blue())
 
     # --- LEAGUE LOGIC ---
     if comp['type'] == 'league':
+        cursor.execute("""
+            SELECT p.id, p.name FROM competition_participants cp
+            JOIN teams p ON cp.participant_id = p.id
+            WHERE cp.competition_id = ? AND cp.participant_type = 'team'
+        """, (comp['id'],))
+        teams = [dict(row) for row in cursor.fetchall()]
+        
         if len(teams) < 2:
+            conn.close()
             return await ctx.send(f"⚠️ Not enough teams in '{comp_name}' to generate league fixtures.")
         
         if len(teams) % 2 != 0:
-            teams.append("BYE")
+            teams.append({'id': None, 'name': "BYE"})
         random.shuffle(teams)
         
         num_weeks = len(teams) - 1
-        for week in range(num_weeks):
-            week_fixtures = []
+        for week in range(1, num_weeks + 1):
+            week_fixtures_display = []
             for i in range(len(teams) // 2):
                 home = teams[i]
                 away = teams[len(teams) - 1 - i]
                 if i != 0 and week % 2 != 0:
-                    week_fixtures.append((away, home))
+                    home, away = away, home
+
+                if "BYE" in (home['name'], away['name']):
+                    bye_team = home if away['name'] == 'BYE' else away
+                    cursor.execute("INSERT INTO fixtures (competition_id, week, participant1_id, is_complete) VALUES (?, ?, ?, 1)",
+                                   (comp['id'], week, bye_team['id']))
+                    week_fixtures_display.append((bye_team['name'], "BYE"))
                 else:
-                    week_fixtures.append((home, away))
+                    cursor.execute("INSERT INTO fixtures (competition_id, week, participant1_id, participant2_id) VALUES (?, ?, ?, ?)",
+                                   (comp['id'], week, home['id'], away['id']))
+                    week_fixtures_display.append((home['name'], away['name']))
             
             week_str = ""
-            for home, away in week_fixtures:
-                if "BYE" in (home, away):
-                    week_str += f"**{home if away == 'BYE' else away}** has a BYE week.\n"
+            for p1_name, p2_name in week_fixtures_display:
+                if p2_name == "BYE":
+                    week_str += f"**{p1_name}** has a BYE week.\n"
                 else:
-                    week_str += f"**{home}** vs **{away}**\n"
-            embed.add_field(name=f"Week {week+1}", value=week_str, inline=False)
-            teams.insert(1, teams.pop()) # Rotate teams
+                    week_str += f"**{p1_name}** vs **{p2_name}**\n"
+            embed.add_field(name=f"Week {week}", value=week_str.strip(), inline=False)
+            teams.insert(1, teams.pop())
 
     # --- CUP LOGIC ---
     elif comp['type'] == 'cup':
+        cursor.execute("""
+            SELECT p.id, p.name FROM competition_participants cp
+            JOIN players p ON cp.participant_id = p.id
+            WHERE cp.competition_id = ? AND cp.participant_type = 'player'
+        """, (comp['id'],))
+        players = [dict(row) for row in cursor.fetchall()]
+        
         if len(players) < 2:
+            conn.close()
             return await ctx.send(f"⚠️ Not enough players in '{comp_name}' to generate cup fixtures.")
         
         random.shuffle(players)
+        round_num = 1
+        
         if len(players) % 2 != 0:
             bye_player = players.pop()
-            embed.add_field(name="First Round Bye", value=f"{bye_player['name']} gets a bye to the next round!", inline=False)
+            cursor.execute("INSERT INTO fixtures (competition_id, round, participant1_id, is_complete) VALUES (?, ?, ?, 1)",
+                           (comp['id'], round_num, bye_player['id']))
+            embed.add_field(name=f"Round {round_num} Bye", value=f"{bye_player['name']} gets a bye to the next round!", inline=False)
         
         cup_str = ""
         for i in range(0, len(players), 2):
-            p1 = players[i]
-            p2 = players[i+1]
+            p1, p2 = players[i], players[i+1]
+            cursor.execute("INSERT INTO fixtures (competition_id, round, participant1_id, participant2_id) VALUES (?, ?, ?, ?)",
+                           (comp['id'], round_num, p1['id'], p2['id']))
             cup_str += f"**{p1['name']}** vs **{p2['name']}**\n"
-        embed.add_field(name="First Round Matches", value=cup_str, inline=False)
+        embed.add_field(name=f"Round {round_num} Matches", value=cup_str.strip(), inline=False)
+
+    conn.commit()
+    conn.close()
 
     await output_channel.send(embed=embed)
-    await ctx.send(f"✅ Fixtures generated in {output_channel.mention}.")
+    await ctx.send(f"✅ Fixtures generated and saved. View them in {output_channel.mention}.")
 
 
 # --- PLAYER-FACING COMMANDS ---
@@ -475,6 +533,21 @@ async def report(ctx, comp_name: str, winner_keyword: str, winner: discord.Membe
     if not comp:
         return await ctx.send(f"⚠️ Competition '{comp_name}' not found.")
     
+    # --- Update Fixture Status ---
+    # Find the corresponding fixture and mark it as complete.
+    # This logic assumes a 1v1 match in either a cup or league context for the two players involved.
+    participant_ids = {winner.id, loser.id}
+    fixture_query = """
+        UPDATE fixtures
+        SET is_complete = 1
+        WHERE competition_id = ? AND is_complete = 0 AND
+              ((participant1_id = ? AND participant2_id = ?) OR (participant1_id = ? AND participant2_id = ?))
+    """
+    cursor.execute(fixture_query, (comp['id'], winner.id, loser.id, loser.id, winner.id))
+
+    # For team-based leagues, we might need a more complex lookup if we're only given players.
+    # For now, this handles cup matches and any league matches reported between two specific players directly.
+
     # --- Process Handicap Logic (if applicable) ---
     handicap_change_msg = ""
     if comp['affects_handicap']:
@@ -548,6 +621,78 @@ async def h2h(ctx, player1: discord.Member, player2: discord.Member):
     embed.add_field(name=player1.display_name, value=f"**{p1_wins}** wins", inline=True)
     embed.add_field(name=player2.display_name, value=f"**{p2_wins}** wins", inline=True)
     await ctx.send(embed=embed)
+
+@bot.command(name='next_game', help='Shows your next opponent in a competition. Usage: !next_game "Comp Name" [@user]')
+async def next_game(ctx, comp_name: str, member: discord.Member = None):
+    """Shows the next upcoming, incomplete fixture for a player or team in a specific competition."""
+    if member is None:
+        member = ctx.author
+
+    conn = db_connect()
+    cursor = conn.cursor()
+
+    # Find the competition
+    cursor.execute("SELECT * FROM competitions WHERE name = ?", (comp_name,))
+    comp = cursor.fetchone()
+    if not comp:
+        conn.close()
+        return await ctx.send(f"⚠️ Competition '{comp_name}' not found.")
+
+    next_fixture = None
+    opponent_name = None
+
+    if comp['type'] == 'cup': # Individual player lookup
+        cursor.execute("""
+            SELECT f.*, p1.name as p1_name, p2.name as p2_name
+            FROM fixtures f
+            LEFT JOIN players p1 ON f.participant1_id = p1.id
+            LEFT JOIN players p2 ON f.participant2_id = p2.id
+            WHERE f.competition_id = ? AND (f.participant1_id = ? OR f.participant2_id = ?) AND f.is_complete = 0
+            ORDER BY f.round ASC
+            LIMIT 1
+        """, (comp['id'], member.id, member.id))
+        fixture = cursor.fetchone()
+        if fixture:
+            opponent_id = fixture['participant2_id'] if fixture['participant1_id'] == member.id else fixture['participant1_id']
+            opponent_name = fixture['p2_name'] if fixture['participant1_id'] == member.id else fixture['p1_name']
+            next_fixture = f"Round {fixture['round']}: **{fixture['p1_name']}** vs **{fixture['p2_name']}**"
+
+    elif comp['type'] == 'league': # Team-based lookup
+        # First, find the user's team
+        cursor.execute("SELECT team_id FROM players WHERE id = ?", (member.id,))
+        player_team = cursor.fetchone()
+        if not player_team or not player_team['team_id']:
+            conn.close()
+            return await ctx.send(f"⚠️ Player {member.display_name} is not assigned to a team.")
+        
+        team_id = player_team['team_id']
+        cursor.execute("""
+            SELECT f.*, t1.name as t1_name, t2.name as t2_name
+            FROM fixtures f
+            JOIN teams t1 ON f.participant1_id = t1.id
+            JOIN teams t2 ON f.participant2_id = t2.id
+            WHERE f.competition_id = ? AND (f.participant1_id = ? OR f.participant2_id = ?) AND f.is_complete = 0
+            ORDER BY f.week ASC
+            LIMIT 1
+        """, (comp['id'], team_id, team_id))
+        fixture = cursor.fetchone()
+        if fixture:
+            opponent_id = fixture['participant2_id'] if fixture['participant1_id'] == team_id else fixture['participant1_id']
+            opponent_name = fixture['t2_name'] if fixture['participant1_id'] == team_id else fixture['t1_name']
+            next_fixture = f"Week {fixture['week']}: **{fixture['t1_name']}** vs **{fixture['t2_name']}**"
+
+    conn.close()
+
+    if next_fixture:
+        embed = discord.Embed(
+            title=f"Next Game for {member.display_name} in {comp_name}",
+            description=next_fixture,
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(f"✅ No upcoming games found for {member.display_name} in '{comp_name}'. All fixtures may be complete!")
+
 
 # --- ERROR HANDLING ---
 @bot.event
