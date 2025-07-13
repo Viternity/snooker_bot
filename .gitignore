@@ -1,0 +1,17 @@
+# Environment variables
+local.env
+.env
+
+# Database file
+league_database.sqlite
+
+# Python bytecode and cache
+__pycache__/
+*.pyc
+
+# IDE/Editor specific
+.vscode/
+.idea/
+
+# macOS specific
+.DS_Store 

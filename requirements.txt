@@ -1,0 +1,7 @@
+# requirements.txt
+#
+# This file lists the Python packages required for the bot.
+# Install them using: pip install -r requirements.txt
+
+discord.py
+python-dotenv
